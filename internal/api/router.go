@@ -90,6 +90,6 @@ func (a *ApiManagerCtx) transcodeStart(profilePath string, input string) (*exec.
 		return nil, fmt.Errorf("stream not found")
 	}
 
-	log.Info().Str("profilePath", profilePath).Str("url", url).Msg("command startred")
+	log.Info().Str("profilePath", profilePath).Str("url", url).Msg("command started")
 	return exec.Command(profilePath, url), nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/m1k1o/go-transcode/internal/utils"
+	"github.com/m1k1o/go-transcode/internal/utils/cmdgroup"
 )
 
 // how often should be cleanup called
@@ -92,8 +93,8 @@ func (m *ManagerCtx) Start() error {
 	read, write := io.Pipe()
 	m.cmd.Stdout = write
 
-	// create a new process group
-	m.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// configure command to run in its own process group / job object
+	cmdgroup.Configure(m.cmd)
 
 	m.active = false
 	m.lastRequest = time.Now()
@@ -195,21 +196,15 @@ func (m *ManagerCtx) Start() error {
 	return err
 }
 
+// Stop terminates the running command and its children.
 func (m *ManagerCtx) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.cmd != nil && m.cmd.Process != nil {
 		m.logger.Debug().Msg("performing stop")
-
-		pgid, err := syscall.Getpgid(m.cmd.Process.Pid)
-		if err == nil {
-			err := syscall.Kill(-pgid, syscall.SIGKILL)
-			m.logger.Err(err).Msg("killing process group")
-		} else {
-			m.logger.Err(err).Msg("could not get process group id")
-			err := m.cmd.Process.Kill()
-			m.logger.Err(err).Msg("killing process")
+		if err := cmdgroup.Kill(m.cmd); err != nil {
+			m.logger.Err(err).Msg("failed to kill process group")
 		}
 	}
 }
