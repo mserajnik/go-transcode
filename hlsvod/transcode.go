@@ -3,6 +3,7 @@ package hlsvod
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
@@ -30,6 +31,88 @@ type VideoProfile struct {
 
 type AudioProfile struct {
 	Bitrate int // in kilobytes
+}
+
+type VideoInfo struct {
+	PixelFormat string `json:"pix_fmt"`
+}
+
+type FFProbeOutput struct {
+	Streams []VideoInfo `json:"streams"`
+}
+
+func detectVideoFormat(ctx context.Context, ffprobeBinary string, inputPath string) (string, error) {
+	args := []string{
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_streams",
+		"-select_streams", "v:0",
+		inputPath,
+	}
+
+	cmd := exec.CommandContext(ctx, ffprobeBinary, args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run ffprobe: %w", err)
+	}
+
+	var probeOutput FFProbeOutput
+	if err := json.Unmarshal(output, &probeOutput); err != nil {
+		return "", fmt.Errorf("failed to parse ffprobe output: %w", err)
+	}
+
+	if len(probeOutput.Streams) == 0 {
+		return "", fmt.Errorf("no video streams found")
+	}
+
+	return probeOutput.Streams[0].PixelFormat, nil
+}
+
+func is422Format(pixelFormat string) bool {
+	format422 := []string{
+		// Standard planar 4:2:2 formats
+		"yuv422p",     // 8-bit planar YUV 4:2:2
+		"yuv422p10le", // 10-bit planar YUV 4:2:2 little endian
+		"yuv422p12le", // 12-bit planar YUV 4:2:2 little endian
+		"yuv422p16le", // 16-bit planar YUV 4:2:2 little endian
+		"yuv422p9le",  // 9-bit planar YUV 4:2:2 little endian
+		"yuv422p10be", // 10-bit planar YUV 4:2:2 big endian
+		"yuv422p12be", // 12-bit planar YUV 4:2:2 big endian
+		"yuv422p16be", // 16-bit planar YUV 4:2:2 big endian
+		"yuv422p9be",  // 9-bit planar YUV 4:2:2 big endian
+		"yuv422p14le", // 14-bit planar YUV 4:2:2 little endian
+		"yuv422p14be", // 14-bit planar YUV 4:2:2 big endian
+
+		// Packed 4:2:2 formats
+		"yuyv422", // YUYV 4:2:2 packed format
+		"uyvy422", // UYVY 4:2:2 packed format
+
+		// JPEG-range 4:2:2 format
+		"yuvj422p", // JPEG-range (full range 0-255) YUV 4:2:2
+
+		// 4:2:2 with alpha channel
+		"yuva422p",                     // 8-bit planar YUV 4:2:2 with alpha
+		"yuva422p9le", "yuva422p9be",   // 9-bit YUV 4:2:2 with alpha
+		"yuva422p10le", "yuva422p10be", // 10-bit YUV 4:2:2 with alpha
+		"yuva422p12le", "yuva422p12be", // 12-bit YUV 4:2:2 with alpha
+		"yuva422p16le", "yuva422p16be", // 16-bit YUV 4:2:2 with alpha
+
+		// Professional/broadcast 4:2:2 formats
+		"v210", // 10-bit 4:2:2 packed format (Avid, Final Cut Pro)
+		"v216", // 16-bit 4:2:2 packed format (QuickTime)
+
+		// Semi-planar 4:2:2 formats (chroma components interleaved)
+		"p210le", "p210be", // 10-bit semi-planar 4:2:2
+		"p216le", "p216be", // 16-bit semi-planar 4:2:2
+	}
+
+	for _, fmt := range format422 {
+		if pixelFormat == fmt {
+			return true
+		}
+	}
+
+	return false
 }
 
 // returns a channel, that delivers name of the segments as they are encoded
@@ -78,6 +161,24 @@ func TranscodeSegments(ctx context.Context, ffmpegBinary string, config Transcod
 		"-sn", // No subtitles
 	}...)
 
+	// Detect video format to determine appropriate profile
+	var useHigh422Profile bool
+	if config.VideoProfile != nil {
+		ffprobeBinary := strings.Replace(ffmpegBinary, "ffmpeg", "ffprobe", 1)
+		pixelFormat, err := detectVideoFormat(ctx, ffprobeBinary, config.InputFilePath)
+		if err != nil {
+			log.Printf("Warning: Could not detect video format, using default profile: %v", err)
+		} else {
+			log.Printf("Detected pixel format: %s", pixelFormat)
+			useHigh422Profile = is422Format(pixelFormat)
+			if useHigh422Profile {
+				log.Printf("Detected 4:2:2 format (%s), using high422 profile", pixelFormat)
+			} else {
+				log.Printf("Using default profile for format: %s", pixelFormat)
+			}
+		}
+	}
+
 	// Video specs
 	if config.VideoProfile != nil {
 		profile := config.VideoProfile
@@ -89,11 +190,16 @@ func TranscodeSegments(ctx context.Context, ffmpegBinary string, config Transcod
 			scale = fmt.Sprintf("scale=%d:-2", profile.Width)
 		}
 
+		videoProfile := "high"
+		if useHigh422Profile {
+			videoProfile = "high422"
+		}
+
 		args = append(args, []string{
 			"-vf", scale,
 			"-c:v", "libx264",
 			"-preset", "faster",
-			"-profile:v", "high",
+			"-profile:v", videoProfile,
 			"-level:v", "4.0",
 			"-b:v", fmt.Sprintf("%dk", profile.Bitrate),
 		}...)
